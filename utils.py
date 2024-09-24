@@ -4,25 +4,43 @@ import os
 from pydub import AudioSegment
 import statistics
 import asyncio
-from functools import lru_cache
+from functools import lru_cache, wraps
 import uuid
 import io
-from json import dump
+from loguru import logger
 
 
 class QuietLogger:
     @staticmethod
     def error(msg):
         if "Unsupported URL:" not in msg:
-            print(msg)
+            logger.error(msg)
 
     @staticmethod
     def warning(msg):
-        pass
+        logger.warning(msg)
 
     @staticmethod
     def debug(msg):
-        pass
+        logger.debug(msg)
+
+
+def retry(retries=3, delay=1, backoff=2):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            attempt = 0
+            while attempt < retries:
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"Error in {func.__name__}: {type(e)}: {e}")
+                    attempt += 1
+                    if attempt == retries:
+                        raise
+                    await asyncio.sleep(delay * (backoff ** (attempt - 1)))
+        return wrapper
+    return decorator
 
 
 class Media:
@@ -33,6 +51,7 @@ class Media:
         self.unique_filename = f"{uuid.uuid4()}"
 
     @property
+    @retry(retries=3, delay=1, backoff=2)
     async def exist(self):
         exist_check_settings = {"quiet": True}
         combined_settings = {**self.yt_dlp_settings, **exist_check_settings}
@@ -43,9 +62,6 @@ class Media:
             )
             return True
         except yt_dlp.DownloadError:
-            return False
-        except Exception as e:
-            print(f"Error checking existence: {e}")
             return False
 
     def _check_exist(self, settings):
@@ -69,6 +85,7 @@ class Media:
             "quiet": True,
         }
 
+    @retry(retries=3, delay=1, backoff=2)
     async def download(self):
         if not os.path.exists(self.output_folder):
             os.makedirs(self.output_folder)
@@ -80,7 +97,7 @@ class Media:
 
         audio_path = os.path.join(
             self.output_folder, f"{self.unique_filename}.mp3"
-        )  # Use .mp3 here
+        )
         relative_audio_path = os.path.relpath(audio_path)
         return relative_audio_path
 
@@ -134,7 +151,50 @@ def get_average_id(results: list) -> int | None:
     for result in results:
         for match in result["matches"]:
             ids.append(int(match["id"]))
-    print(ids)
+    logger.info(f"Collected IDs: {ids}")
     if len(ids) == 0:
         return None
     return statistics.mean(ids)
+
+
+def parse_music_info(data):
+    def get_metadata_value(metadata_list, title):
+        return next(
+            (item.get("text") for item in metadata_list if item.get("title") == title),
+            None,
+        )
+
+    parsed_info = {
+        "title": data.get("title"),
+        "subtitle": data.get("subtitle"),
+        "artist": data.get("artists")[0].get("alias") if data.get("artists") else None,
+        "album": get_metadata_value(
+            data.get("sections", [])[0].get("metadata", []), "Album"
+        ),
+        "label": get_metadata_value(
+            data.get("sections", [])[0].get("metadata", []), "Label"
+        ),
+        "released": get_metadata_value(
+            data.get("sections", [])[0].get("metadata", []), "Released"
+        ),
+        "genre": data.get("genres", {}).get("primary"),
+        "coverart": data.get("images", {}).get("coverart"),
+        "apple_music_url": next(
+            (
+                action.get("uri")
+                for action in data.get("hub", {}).get("actions", [])
+                if action.get("type") == "uri"
+            ),
+            None,
+        ),
+        "youtube_music_url": next(
+            (
+                provider.get("actions")[0].get("uri")
+                for provider in data.get("hub", {}).get("providers", [])
+                if provider.get("type") == "YOUTUBEMUSIC"
+            ),
+            None,
+        ),
+        "shazam_url": data.get("url"),
+    }
+    return parsed_info
