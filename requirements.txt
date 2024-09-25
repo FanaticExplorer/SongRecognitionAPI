@@ -1,0 +1,6 @@
+fastapi
+pydantic
+shazamio
+yt-dlp
+pydub
+aiohttp

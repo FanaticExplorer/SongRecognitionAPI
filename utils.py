@@ -8,8 +8,6 @@ from functools import lru_cache, wraps
 import uuid
 import io
 from loguru import logger
-
-asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import aiohttp
 
 
