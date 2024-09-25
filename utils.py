@@ -9,6 +9,9 @@ import uuid
 import io
 from loguru import logger
 
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+import aiohttp
+
 
 class QuietLogger:
     @staticmethod
@@ -39,7 +42,9 @@ def retry(retries=3, delay=1, backoff=2):
                     if attempt == retries:
                         raise
                     await asyncio.sleep(delay * (backoff ** (attempt - 1)))
+
         return wrapper
+
     return decorator
 
 
@@ -95,9 +100,7 @@ class Media:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._download_audio, ydl_opts)
 
-        audio_path = os.path.join(
-            self.output_folder, f"{self.unique_filename}.mp3"
-        )
+        audio_path = os.path.join(self.output_folder, f"{self.unique_filename}.mp3")
         relative_audio_path = os.path.relpath(audio_path)
         return relative_audio_path
 
@@ -197,3 +200,64 @@ def parse_music_info(data):
         "shazam_url": data.get("url"),
     }
     return parsed_info
+
+
+class DirectMedia:
+    def __init__(self, url):
+        self.url = url
+        self.sem = asyncio.Semaphore(30)
+        self.ALLOWED_CONTENT_TYPES = {
+            # Audio formats
+            "audio/mpeg": "mp3",
+            "audio/wav": "wav",
+            "audio/aac": "aac",
+            "audio/ogg": "ogg",
+            "audio/flac": "flac",
+            "audio/x-wav": "wav",
+            "audio/x-aiff": "aiff",
+            "audio/x-ms-wma": "wma",
+            "audio/webm": "weba",
+            "audio/mp4": "m4a",
+            "audio/x-m4a": "m4a",
+            "audio/x-vorbis+ogg": "ogg",
+            "audio/amr": "amr",
+            "audio/x-matroska": "mka",
+
+            # Video formats
+            "video/mp4": "mp4",
+            "video/avi": "avi",
+            "video/x-msvideo": "avi",
+            "video/webm": "webm",
+            "video/quicktime": "mov",
+            "video/x-matroska": "mkv",
+            "video/x-flv": "flv",
+            "video/mpeg": "mpeg",
+            "video/3gpp": "3gp",
+            "video/x-ms-wmv": "wmv",
+            "video/x-ms-asf": "asf",
+            "video/x-msv": "msv",
+            "video/x-ms-vob": "vob",
+            "video/ogg": "ogv",
+            "video/x-f4v": "f4v",
+            "video/x-m4v": "m4v",
+            "video/x-mjpeg": "mjpeg",
+            "video/avchd": "avchd",
+        }
+        self.extension = None
+
+    @property
+    async def exist(self) -> bool:
+        async with aiohttp.ClientSession(raise_for_status=True) as session:
+            async with session.head(self.url, allow_redirects=True) as response:
+                content_type = response.headers.get("Content-Type")
+                self.extension = self.ALLOWED_CONTENT_TYPES.get(content_type)
+                return content_type in list(self.ALLOWED_CONTENT_TYPES)
+
+    async def download(self, path):
+        async with self.sem:
+            async with aiohttp.ClientSession(raise_for_status=True) as session:
+                async with session.get(self.url) as response:
+                    with open(path, "wb") as fd:
+                        async for chunk in response.content.iter_chunked(1024):
+                            # noinspection PyTypeChecker
+                            fd.write(chunk)
