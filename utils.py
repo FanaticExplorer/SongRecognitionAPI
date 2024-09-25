@@ -151,7 +151,6 @@ def get_average_id(results: list) -> int | None:
     for result in results:
         for match in result["matches"]:
             ids.append(int(match["id"]))
-    logger.info(f"Collected IDs: {ids}")
     if len(ids) == 0:
         return None
     return statistics.mean(ids)
