@@ -9,6 +9,15 @@ import uuid
 import io
 from loguru import logger
 import aiohttp
+from fastapi import HTTPException
+import sys
+
+from shazamio import Shazam
+
+shazam = Shazam()
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 class QuietLogger:
@@ -181,9 +190,9 @@ def parse_music_info(data):
         "coverart": data.get("images", {}).get("coverart"),
         "apple_music_url": next(
             (
-                action.get("uri")
-                for action in data.get("hub", {}).get("actions", [])
-                if action.get("type") == "uri"
+                option.get("actions")[0].get("uri")
+                for option in data.get("hub", {}).get("options", [])
+                if option.get("actions")
             ),
             None,
         ),
@@ -204,43 +213,6 @@ class DirectMedia:
     def __init__(self, url):
         self.url = url
         self.sem = asyncio.Semaphore(30)
-        self.ALLOWED_CONTENT_TYPES = {
-            # Audio formats
-            "audio/mpeg": "mp3",
-            "audio/wav": "wav",
-            "audio/aac": "aac",
-            "audio/ogg": "ogg",
-            "audio/flac": "flac",
-            "audio/x-wav": "wav",
-            "audio/x-aiff": "aiff",
-            "audio/x-ms-wma": "wma",
-            "audio/webm": "weba",
-            "audio/mp4": "m4a",
-            "audio/x-m4a": "m4a",
-            "audio/x-vorbis+ogg": "ogg",
-            "audio/amr": "amr",
-            "audio/x-matroska": "mka",
-
-            # Video formats
-            "video/mp4": "mp4",
-            "video/avi": "avi",
-            "video/x-msvideo": "avi",
-            "video/webm": "webm",
-            "video/quicktime": "mov",
-            "video/x-matroska": "mkv",
-            "video/x-flv": "flv",
-            "video/mpeg": "mpeg",
-            "video/3gpp": "3gp",
-            "video/x-ms-wmv": "wmv",
-            "video/x-ms-asf": "asf",
-            "video/x-msv": "msv",
-            "video/x-ms-vob": "vob",
-            "video/ogg": "ogv",
-            "video/x-f4v": "f4v",
-            "video/x-m4v": "m4v",
-            "video/x-mjpeg": "mjpeg",
-            "video/avchd": "avchd",
-        }
         self.extension = None
 
     @property
@@ -248,8 +220,7 @@ class DirectMedia:
         async with aiohttp.ClientSession(raise_for_status=True) as session:
             async with session.head(self.url, allow_redirects=True) as response:
                 content_type = response.headers.get("Content-Type")
-                self.extension = self.ALLOWED_CONTENT_TYPES.get(content_type)
-                return content_type in list(self.ALLOWED_CONTENT_TYPES)
+                return content_type.startswith("video") or content_type.startswith("audio")
 
     async def download(self, path):
         async with self.sem:
@@ -259,3 +230,30 @@ class DirectMedia:
                         async for chunk in response.content.iter_chunked(1024):
                             # noinspection PyTypeChecker
                             fd.write(chunk)
+
+
+async def process_audio(audio_file):
+    results = []
+    for clip in split_audio_to_clips(audio_file):
+        try:
+            # Try to recognize the clip
+            clip_result = await shazam.recognize(clip)
+        except Exception as e:
+            # If there was an error, log the error and continue
+            logger.error(f"Error recognizing clip: {type(e)}: {e}")
+        else:
+            # If the recognition was successful, add the result to the list
+            results.append(clip_result)
+    # Remove the original audio file
+    os.remove(audio_file)
+    average_id = get_average_id(results)
+    if average_id is None:
+        # If no matches were found, return a 404
+        return HTTPException(status_code=404, detail="No matches found")
+    # If there were matches, get the track with the average id
+    result = await shazam.track_about(average_id)
+    parsed_result = parse_music_info(result)
+
+    return parsed_result
+
+

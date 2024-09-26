@@ -1,64 +1,21 @@
-# main.py
 from fastapi import FastAPI, Request, HTTPException, File, UploadFile
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import HttpUrl
-from shazamio import Shazam
-import asyncio
-from utils import Media, split_audio_to_clips, get_average_id, parse_music_info, DirectMedia
+from utils import Media, DirectMedia, process_audio
 import os
 from loguru import logger
 from sys import stderr
 import uuid
+import asyncio
+from tempfile import NamedTemporaryFile
+from contextlib import asynccontextmanager
+import filetype
 import subprocess
-
-# FastAPI app
-app = FastAPI()
-
-# Initialize the Shazam object
-shazam = Shazam()
-loop = asyncio.get_event_loop()
 
 # Configure Loguru
 logger.configure(handlers=[{"sink": stderr, "level": "INFO"}])
 logger.add("logs/{time:YYYY-MM-DD}.log", rotation="00:00", level="DEBUG")
-
-
-@app.get("/", response_class=RedirectResponse, include_in_schema=False)
-def read_root():
-    return "/docs"
-
-
-# Endpoint to recognize a link
-@app.get("/recognize/link")
-@logger.catch()
-async def recognize_link(link: HttpUrl):
-    media = Media(link)
-    if not await media.exist:
-        raise HTTPException(status_code=404, detail="No video is given in the link")
-    audio_file = await media.download()
-    results = []
-    for clip in split_audio_to_clips(audio_file):
-        try:
-            # Try to recognize the clip
-            clip_result = await shazam.recognize(clip)
-        except Exception as e:
-            # If there was an error, log the error and continue
-            logger.error(f"Error recognizing clip: {type(e)}: {e}")
-        else:
-            # If the recognition was successful, add the result to the list
-            results.append(clip_result)
-    # Remove the original audio file
-    os.remove(audio_file)
-    average_id = get_average_id(results)
-    if average_id is None:
-        # If no matches were found, return a 404
-        return HTTPException(status_code=404, detail="No matches found")
-    # If there were matches, get the track with the average id
-    result = await shazam.track_about(average_id)
-    parsed_result = parse_music_info(result)
-    return parsed_result
-
 
 ALLOWED_CONTENT_TYPES = [
     "audio/mpeg",  # MP3
@@ -68,159 +25,147 @@ ALLOWED_CONTENT_TYPES = [
 ]
 
 
-@app.post("/recognize/file")
-@logger.catch()
-async def recognize_file(file: UploadFile = File(...)):
-    if file.content_type not in ALLOWED_CONTENT_TYPES:
-        return HTTPException(status_code=400, detail="Invalid file type")
-
+@asynccontextmanager
+async def lifespan(api_app: FastAPI):
     os.makedirs("user_files", exist_ok=True)
     os.makedirs("audio", exist_ok=True)
-    # Save original file
-    original_filename = f"user_files/{uuid.uuid4()}{os.path.splitext(file.filename)[1]}"
-    with open(original_filename, "wb") as f:
-        f.write(file.file.read())
+    print("Folders initialized")
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    print("Event loop initialized")
+    yield
+    print("Bye!")
 
-    # Generate output filename
-    audio_file = f"audio/{uuid.uuid4()}.mp3"
 
-    # Convert to MP3 using ffmpeg
-    subprocess.run(
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/", response_class=RedirectResponse, include_in_schema=False)
+def read_root():
+    return "/docs"
+
+
+# Utility function for async ffmpeg execution
+async def convert_to_mp3(input_file: str, output_file: str):
+    await asyncio.to_thread(
+        subprocess.run,
         [
             "ffmpeg",
-            "-i",
-            original_filename,
-            "-vn",  # Disable video processing
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "128k",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            "-filter:a",
-            "aresample=async=1",
-            "-y",
-            audio_file,
+            "-i", input_file,
+            "-vn",
+            "-c:a", "libmp3lame",
+            "-b:a", "128k",
+            "-ar", "44100",
+            "-ac", "2",
+            "-filter:a", "aresample=async=1",
+            "-y", output_file
         ],
-        check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
     )
 
-    # Remove original file
-    os.remove(original_filename)
 
-    results = []
-    for clip in split_audio_to_clips(audio_file):
-        try:
-            # Try to recognize the clip
-            clip_result = await shazam.recognize(clip)
-        except Exception as e:
-            # If there was an error, log the error and continue
-            logger.error(f"Error recognizing clip: {type(e)}: {e}")
-        else:
-            # If the recognition was successful, add the result to the list
-            results.append(clip_result)
-    # Remove the original audio file
-    os.remove(audio_file)
-    average_id = get_average_id(results)
-    if average_id is None:
-        # If no matches were found, return a 404
-        return HTTPException(status_code=404, detail="No matches found")
+# Endpoint to recognize a link
+@app.get("/recognize/link", tags=["Recognition"], summary="Process media from a link")
+@logger.catch()
+async def recognize_link(link: HttpUrl):
+    media = Media(link)
+    if not await media.exist:
+        return HTTPException(status_code=404, detail="No video is given in the link")
+    audio_file = await media.download()
 
-    result = await shazam.track_about(average_id)
-    parsed_result = parse_music_info(result)
+    parsed_result = await process_audio(audio_file)
+
     return parsed_result
 
 
-@app.post("/recognize/direct_link")
+@app.post(
+    "/recognize/file",
+    tags=["Recognition"],
+    summary="Upload a media file for recognition",
+)
+@logger.catch()
+async def recognize_file(file: UploadFile = File(...)):
+    """
+    Upload an audio or video file to extract and process its audio content.
+    """
+    # Use filetype library to check the actual file type
+    file_data = await file.read(1024)  # Read first 1024 bytes
+    kind = filetype.guess(file_data)
+    file.file.seek(0)  # Reset file pointer after reading
+
+    if kind is None or (not kind.mime.startswith("audio") and not kind.mime.startswith("video")):
+        return HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: {kind.mime if kind else 'Unknown'}",
+        )
+
+    # Use a temporary file to save the uploaded file
+    with NamedTemporaryFile(delete=False) as temp_file:
+        temp_file.write(await file.read())
+        temp_file.flush()
+        temp_file_name = temp_file.name
+
+    # Generate output filename for the mp3
+    audio_file = f"audio/{uuid.uuid4()}.mp3"
+
+    # Convert file asynchronously using ffmpeg
+    await convert_to_mp3(temp_file_name, audio_file)
+
+    # Remove the temporary original file
+    os.remove(temp_file_name)
+
+    # Process the audio and return the result
+    parsed_result = await process_audio(audio_file)
+    return parsed_result
+
+
+@app.get(
+    "/recognize/direct_link",
+    tags=["Recognition"],
+    summary="Process media from the direct link",
+)
 @logger.catch()
 async def recognize_direct_link(link: HttpUrl):
     media = DirectMedia(link)
     if not await media.exist:
-        return HTTPException(status_code=404, detail="No video/audio is given in the link")
+        return HTTPException(
+            status_code=404, detail="No video/audio is given in the link"
+        )
 
-    os.makedirs("user_files", exist_ok=True)
-    os.makedirs("audio", exist_ok=True)
-    # Save original file
+    # Use a temporary file for the download
     original_filename = f"user_files/{uuid.uuid4()}.{media.extension}"
     await media.download(original_filename)
 
-    # Generate output filename
+    # Generate output filename for the mp3
     audio_file = f"audio/{uuid.uuid4()}.mp3"
 
-    # Convert to MP3 using ffmpeg
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-i",
-            original_filename,
-            "-vn",  # Disable video processing
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "128k",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            "-filter:a",
-            "aresample=async=1",
-            "-y",
-            audio_file,
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-    )
+    # Convert file asynchronously using ffmpeg
+    await convert_to_mp3(original_filename, audio_file)
 
-    # Remove original file
+    # Remove the original downloaded file
     os.remove(original_filename)
 
-    results = []
-    for clip in split_audio_to_clips(audio_file):
-        try:
-            # Try to recognize the clip
-            clip_result = await shazam.recognize(clip)
-        except Exception as e:
-            # If there was an error, log the error and continue
-            logger.error(f"Error recognizing clip: {type(e)}: {e}")
-        else:
-            # If the recognition was successful, add the result to the list
-            results.append(clip_result)
-    # Remove the original audio file
-    os.remove(audio_file)
-    average_id = get_average_id(results)
-    if average_id is None:
-        # If no matches were found, return a 404
-        return HTTPException(status_code=404, detail="No matches found")
-
-    result = await shazam.track_about(average_id)
-    parsed_result = parse_music_info(result)
+    parsed_result = await process_audio(audio_file)
     return parsed_result
 
 
-# noinspection PyUnusedLocal
+# Custom exception handler for validation errors
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return HTTPException(
-        status_code=400,
-        detail="Invalid input",
-    )
+    logger.warning(f"Validation error: {exc}")
+    return JSONResponse(status_code=400, content={"detail": "Invalid input"})
 
 
-# noinspection PyUnusedLocal
+# Custom exception handler for generic exceptions
 @app.exception_handler(Exception)
 async def any_exception_handler(request: Request, exc: Exception):
-    return HTTPException(
+    logger.error(f"Unexpected error: {exc}")
+    return JSONResponse(
         status_code=500,
-        detail=f"Unexpected error: {type(exc)}: {exc}",
+        content={"detail": f"Unexpected error occurred: {type(exc).__name__}"},
     )
 
 
-# Run the app
 if __name__ == "__main__":
     import uvicorn
 

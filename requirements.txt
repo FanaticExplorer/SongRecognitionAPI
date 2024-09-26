@@ -4,3 +4,5 @@ shazamio
 yt-dlp
 pydub
 aiohttp
+uvicorn
+filetype
